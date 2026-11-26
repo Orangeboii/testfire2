@@ -70,3 +70,16 @@ CREATE TABLE IF NOT EXISTS rpa_approvals (
   decided_by TEXT,
   inbound_message_id TEXT UNIQUE
 );
+
+DO $migration$
+BEGIN
+  ALTER TABLE rpa_approvals ADD COLUMN IF NOT EXISTS flow_version INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE rpa_approvals ALTER COLUMN send_started_at DROP NOT NULL;
+  ALTER TABLE rpa_approvals DROP CONSTRAINT IF EXISTS rpa_approvals_dispatch_status_check;
+  ALTER TABLE rpa_approvals ADD CONSTRAINT rpa_approvals_dispatch_status_check
+    CHECK (dispatch_status IN ('READY', 'SENDING', 'SENT', 'UNCERTAIN', 'BLOCKED'));
+  ALTER TABLE rpa_approvals DROP CONSTRAINT IF EXISTS rpa_approvals_send_after_decision_check;
+  ALTER TABLE rpa_approvals ADD CONSTRAINT rpa_approvals_send_after_decision_check
+    CHECK (flow_version = 1 OR dispatch_status NOT IN ('SENDING','SENT','UNCERTAIN') OR decision = 'APPROVED');
+END
+$migration$;
