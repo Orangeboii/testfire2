@@ -133,8 +133,127 @@ export default async function handler(req, res) {
       return res.status(404).json({ ok: false, error: "Run was not found in rpa_runs" });
     }
 
+
+    if (body.action === "approval_capabilities") {
+      const rows = await sql`SELECT to_regclass('public.rpa_approvals') IS NOT NULL AS enabled`;
+      return res.status(200).json({ ok: true, version: 1, enabled: rows[0].enabled });
+    }
+
+    if (body.action === "approval_begin") {
+      const id = body.outbound_message_id;
+      if (!isUuid(body.job_id) || !isId(body.run_id) || !isId(body.worker_id) ||
+          (!Number.isSafeInteger(body.attempt) || body.attempt < 1) ||
+          typeof id !== "string" || !/^<rpa\.[0-9a-f-]{36}@mantistcy\.cl>$/.test(id)) {
+        return res.status(400).json({ ok: false, error: "Invalid reservation" });
+      }
+      const rows = await sql`
+        WITH owned AS (
+          SELECT run_id FROM rpa_verification_queue
+          WHERE job_id = ${body.job_id}::uuid AND run_id = ${body.run_id}
+            AND status = 'PROCESSING' AND locked_by = ${body.worker_id} AND lease_until > NOW()
+            AND attempts = ${body.attempt}
+            AND email_payload #> '{approval,required}' = 'true'::jsonb
+          FOR UPDATE
+        )
+        INSERT INTO rpa_approvals (run_id, dispatch_status, worker_id, outbound_message_id)
+        SELECT run_id, 'SENDING', ${body.worker_id}, ${id} FROM owned
+        ON CONFLICT DO NOTHING RETURNING run_id
+      `;
+      if (!rows.length) return res.status(409).json({ ok: false, error: "Reservation not granted" });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (body.action === "approval_finish") {
+      if (!isUuid(body.job_id) || !isId(body.run_id) || !isId(body.worker_id) ||
+          typeof body.smtp_accepted !== "boolean") {
+        return res.status(400).json({ ok: false, error: "Invalid completion" });
+      }
+      const accepted = body.smtp_accepted;
+      const rows = await sql`
+        WITH owned AS (
+          SELECT run_id FROM rpa_verification_queue
+          WHERE job_id = ${body.job_id}::uuid AND run_id = ${body.run_id}
+            AND status = 'PROCESSING' AND locked_by = ${body.worker_id}
+          FOR UPDATE
+        ), recorded AS (
+          UPDATE rpa_approvals a
+          SET dispatch_status = ${accepted ? "SENT" : "UNCERTAIN"},
+              sent_at = CASE WHEN ${accepted} THEN NOW() ELSE NULL END
+          FROM owned WHERE a.run_id = owned.run_id AND a.worker_id = ${body.worker_id}
+            AND a.dispatch_status = 'SENDING'
+          RETURNING a.run_id
+        )
+        UPDATE rpa_verification_queue q
+        SET status = ${accepted ? "DONE" : "REVIEW"},
+            verification_status = ${accepted ? (body.warning === true ? "WARNING" : "OK") : "ERROR"},
+            verification_details = jsonb_build_object('email_sent', ${accepted}::boolean,
+              'approval_status', 'PENDING'),
+            last_error = ${accepted ? null : "Envío incierto; revisar manualmente sin reenviar."},
+            locked_by = NULL, lease_until = NULL, completed_at = NOW(), updated_at = NOW()
+        FROM recorded WHERE q.run_id = recorded.run_id RETURNING q.run_id
+      `;
+      if (!rows.length) return res.status(409).json({ ok: false, error: "Reservation not active" });
+      return res.status(200).json({ ok: true });
+    }
+
+    if (body.action === "approval_lookup") {
+      if (!isId(body.run_id)) return res.status(400).json({ ok: false, error: "Invalid run_id" });
+      const rows = await sql`
+        SELECT run_id, dispatch_status, decision, outbound_message_id, inbound_message_id
+        FROM rpa_approvals WHERE run_id = ${body.run_id}
+      `;
+      return res.status(200).json({ ok: true, approval: rows[0] || null });
+    }
+
+    if (body.action === "approval_decide") {
+      const supervisor = "nico.cuevasl@duocuc.cl";
+      const id = body.inbound_message_id;
+      if (!isId(body.run_id) || body.sender !== supervisor ||
+          !["APPROVED", "REJECTED"].includes(body.approval_decision) ||
+          body.outbound_message_id?.length > 240 || !isId(body.outbound_message_id) ||
+          typeof id !== "string" || id.length > 512 || !/^<[^<>\s]+>$/.test(id)) {
+        return res.status(400).json({ ok: false, error: "Invalid supervisor decision" });
+      }
+      const rows = await sql`
+        UPDATE rpa_approvals
+        SET decision = ${body.approval_decision}, decided_at = NOW(),
+            decided_by = ${supervisor}, inbound_message_id = ${id}
+        WHERE run_id = ${body.run_id} AND outbound_message_id = ${body.outbound_message_id}
+          AND dispatch_status = 'SENT' AND decision = 'PENDING'
+        RETURNING run_id, decision, decided_at
+      `;
+      if (rows.length) return res.status(200).json({ ok: true, approval: rows[0] });
+      const existing = await sql`
+        SELECT run_id, decision, decided_at FROM rpa_approvals
+        WHERE run_id = ${body.run_id} AND inbound_message_id = ${id}
+          AND decision = ${body.approval_decision}
+      `;
+      if (existing.length) return res.status(200).json({ ok: true, duplicate: true, approval: existing[0] });
+      return res.status(409).json({ ok: false, error: "Decision not accepted" });
+    }
+
     if (body.action === "claim") {
       if (!isId(body.worker_id)) return res.status(400).json({ ok: false, error: "worker_id is required" });
+
+
+      if (body.approval_only === true) {
+        await sql`
+          WITH stale AS (
+            SELECT q.run_id FROM rpa_verification_queue q
+            JOIN rpa_approvals a ON a.run_id = q.run_id
+            WHERE q.status = 'PROCESSING' AND q.lease_until < NOW() AND a.dispatch_status = 'SENDING'
+            FOR UPDATE OF q SKIP LOCKED
+          ), uncertain AS (
+            UPDATE rpa_approvals a SET dispatch_status = 'UNCERTAIN'
+            FROM stale WHERE a.run_id = stale.run_id AND a.dispatch_status = 'SENDING'
+            RETURNING a.run_id
+          )
+          UPDATE rpa_verification_queue q SET status = 'REVIEW', verification_status = 'ERROR',
+            last_error = 'Resultado SMTP incierto. Revisar Enviados antes de repetir.',
+            locked_by = NULL, lease_until = NULL, completed_at = NOW(), updated_at = NOW()
+          FROM uncertain WHERE q.run_id = uncertain.run_id
+        `;
+      }
 
       // One atomic statement leases a single job. An expired lease makes a job
       // available again if a worker computer stops unexpectedly.
@@ -145,11 +264,15 @@ export default async function handler(req, res) {
               last_error = COALESCE(last_error, 'Worker lease expired after the final attempt'),
               updated_at = NOW()
           WHERE status = 'PROCESSING' AND lease_until < NOW() AND attempts >= max_attempts
+            AND (email_payload ? 'approval') = ${body.approval_only === true}
+            AND NOT EXISTS (SELECT 1 FROM rpa_approvals a WHERE a.run_id = rpa_verification_queue.run_id)
           RETURNING job_id
         ), candidate AS (
           SELECT q.job_id
           FROM rpa_verification_queue q
           WHERE q.attempts < q.max_attempts
+            AND (q.email_payload ? 'approval') = ${body.approval_only === true}
+            AND NOT EXISTS (SELECT 1 FROM rpa_approvals a WHERE a.run_id = q.run_id)
             AND (q.status = 'PENDING' OR (q.status = 'PROCESSING' AND q.lease_until < NOW()))
           ORDER BY q.created_at, q.job_id
           LIMIT 1
@@ -167,6 +290,7 @@ export default async function handler(req, res) {
           RETURNING q.job_id, q.run_id, q.attempts, q.max_attempts, q.lease_until
         )
         SELECT c.job_id, c.run_id, c.attempts, c.max_attempts, c.lease_until,
+               ${body.worker_id}::text AS worker_id,
                q.email_payload,
                r.status AS run_status, r.web_rows, r.api_rows,
                r.api_http_status, r.api_message, r.feedback_result,
@@ -210,6 +334,7 @@ export default async function handler(req, res) {
           AND run_id = ${body.run_id}
           AND status = 'PROCESSING'
           AND locked_by = ${body.worker_id}
+          AND NOT EXISTS (SELECT 1 FROM rpa_approvals a WHERE a.run_id = rpa_verification_queue.run_id)
         RETURNING job_id, run_id, status, verification_status, completed_at
       `;
       if (!rows.length) return res.status(409).json({ ok: false, error: "Job lease is no longer owned by this worker" });
@@ -228,6 +353,7 @@ export default async function handler(req, res) {
         WHERE job_id = ${body.job_id}::uuid
           AND status = 'PROCESSING'
           AND locked_by = ${body.worker_id}
+          AND NOT EXISTS (SELECT 1 FROM rpa_approvals a WHERE a.run_id = rpa_verification_queue.run_id)
         RETURNING job_id, run_id, status, attempts, max_attempts, last_error
       `;
       if (!rows.length) return res.status(409).json({ ok: false, error: "Job lease is no longer owned by this worker" });
