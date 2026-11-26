@@ -57,3 +57,16 @@ CREATE INDEX IF NOT EXISTS idx_rpa_verification_queue_pending
 CREATE INDEX IF NOT EXISTS idx_rpa_verification_queue_lease
   ON rpa_verification_queue (lease_until)
   WHERE status = 'PROCESSING';
+
+CREATE TABLE IF NOT EXISTS rpa_approvals (
+  run_id TEXT PRIMARY KEY REFERENCES rpa_verification_queue(run_id) ON DELETE RESTRICT,
+  dispatch_status TEXT NOT NULL CHECK (dispatch_status IN ('SENDING', 'SENT', 'UNCERTAIN')),
+  decision TEXT NOT NULL DEFAULT 'PENDING' CHECK (decision IN ('PENDING', 'APPROVED', 'REJECTED')),
+  worker_id TEXT NOT NULL,
+  outbound_message_id TEXT NOT NULL UNIQUE,
+  send_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  sent_at TIMESTAMPTZ,
+  decided_at TIMESTAMPTZ,
+  decided_by TEXT,
+  inbound_message_id TEXT UNIQUE
+);
