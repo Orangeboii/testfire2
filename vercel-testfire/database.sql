@@ -83,3 +83,8 @@ BEGIN
     CHECK (flow_version = 1 OR dispatch_status NOT IN ('SENDING','SENT','UNCERTAIN') OR decision = 'APPROVED');
 END
 $migration$;
+
+ALTER TABLE rpa_approvals
+  ADD COLUMN IF NOT EXISTS notice_message_id TEXT UNIQUE,
+  ADD COLUMN IF NOT EXISTS notice_started_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS notice_sent_at TIMESTAMPTZ;
