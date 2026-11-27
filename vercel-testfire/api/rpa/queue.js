@@ -135,10 +135,55 @@ export default async function handler(req, res) {
 
 
     if (body.action === "approval_capabilities") {
-      const rows = await sql`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'rpa_approvals' AND column_name = 'flow_version') AS enabled`;
-      return res.status(200).json({ ok: true, version: 2, enabled: rows[0].enabled });
+      const rows = await sql`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'rpa_approvals' AND column_name = 'notice_sent_at') AS enabled`;
+      return res.status(200).json({ ok: true, version: 3, enabled: rows[0].enabled });
     }
 
+
+
+    if (body.action === "approval_notice_next") {
+      if (!isId(body.worker_id)) return res.status(400).json({ ok: false, error: "worker_id is required" });
+      const rows = await sql`
+        SELECT q.run_id, r.status AS run_status, r.web_rows, r.api_rows,
+               q.email_payload->>'body_text' AS report_body
+        FROM rpa_approvals a JOIN rpa_verification_queue q USING (run_id) JOIN rpa_runs r USING (run_id)
+        WHERE a.flow_version = 2 AND a.dispatch_status = 'READY' AND a.decision = 'PENDING'
+          AND a.notice_started_at IS NULL AND q.status = 'PENDING'
+        ORDER BY q.created_at, q.job_id LIMIT 1
+      `;
+      return res.status(200).json({ ok: true, notice: rows[0] || null });
+    }
+
+    if (body.action === "approval_notice_begin") {
+      if (!isUuid(body.run_id) || !isId(body.worker_id)) {
+        return res.status(400).json({ ok: false, error: "Invalid notice reservation" });
+      }
+      const id = "<rpa.aprobar." + body.run_id + "@mantistcy.cl>";
+      const rows = await sql`
+        UPDATE rpa_approvals
+        SET notice_started_at = NOW(), notice_message_id = ${id}
+        WHERE run_id = ${body.run_id} AND flow_version = 2
+          AND dispatch_status = 'READY' AND decision = 'PENDING' AND notice_started_at IS NULL
+        RETURNING notice_message_id
+      `;
+      if (!rows.length) return res.status(409).json({ ok: false, error: "Notice already reserved or unavailable" });
+      return res.status(200).json({ ok: true, notice_message_id: rows[0].notice_message_id });
+    }
+
+    if (body.action === "approval_notice_finish") {
+      if (!isUuid(body.run_id) || !isId(body.worker_id)) {
+        return res.status(400).json({ ok: false, error: "Invalid notice confirmation" });
+      }
+      const rows = await sql`
+        UPDATE rpa_approvals
+        SET notice_sent_at = COALESCE(notice_sent_at, NOW())
+        WHERE run_id = ${body.run_id} AND notice_started_at IS NOT NULL
+          AND notice_message_id = ${"<rpa.aprobar." + body.run_id + "@mantistcy.cl>"}
+        RETURNING notice_sent_at
+      `;
+      if (!rows.length) return res.status(409).json({ ok: false, error: "Notice not reserved" });
+      return res.status(200).json({ ok: true, sent_at: rows[0].notice_sent_at });
+    }
 
     if (body.action === "approval_ready") {
       if (!isUuid(body.job_id) || !isUuid(body.run_id) || !isId(body.worker_id) ||
@@ -273,7 +318,7 @@ export default async function handler(req, res) {
     if (body.action === "approval_lookup") {
       if (!isId(body.run_id)) return res.status(400).json({ ok: false, error: "Invalid run_id" });
       const rows = await sql`
-        SELECT run_id, dispatch_status, decision, outbound_message_id, inbound_message_id, flow_version
+        SELECT run_id, dispatch_status, decision, outbound_message_id, inbound_message_id, flow_version, notice_message_id
         FROM rpa_approvals WHERE run_id = ${body.run_id}
       `;
       return res.status(200).json({ ok: true, approval: rows[0] || null });
@@ -300,6 +345,7 @@ export default async function handler(req, res) {
             AND ((a.flow_version = 2 AND a.dispatch_status = 'READY') OR
                  (a.flow_version = 1 AND a.dispatch_status = 'SENT'))
             AND a.decision = 'PENDING'
+            AND (a.notice_message_id IS NULL OR a.notice_message_id = ${body.notice_reference ?? null})
             AND NOT EXISTS (SELECT 1 FROM rpa_approvals previous WHERE previous.inbound_message_id = ${id})
           RETURNING a.run_id, a.decision, a.decided_at, a.flow_version
         )
